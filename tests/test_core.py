@@ -169,6 +169,64 @@ class MarketTests(unittest.TestCase):
                 self.assertIn("Datenalter:", text)
                 self.assertNotIn("00:00 UTC", text)
 
+    def test_german_close_is_last_close_not_intraday(self):
+        yesterday = 1_794_934_800  # 2026-11-17 18:00 Europe/Berlin
+        today_bar = 1_794_988_800  # 2026-11-18 09:00, Schluss null
+        quote = 1_794_994_200  # 2026-11-18 10:30, steht aber nach dem Schluss fest
+        # Abend: Yahoo zeigt das Fenster des nächsten Tages und oft kein marketState.
+        evening = datetime(2026, 11, 18, 22, 30, tzinfo=timezone.utc)
+        next_open = int(datetime(2026, 11, 19, 8, 0, tzinfo=timezone.utc).timestamp())
+        next_close = int(datetime(2026, 11, 19, 16, 30, tzinfo=timezone.utc).timestamp())
+        for symbol in ("SAP.DE", "^GDAXI"):
+            with self.subTest(symbol=symbol):
+                payload = {
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {
+                                    "symbol": symbol,
+                                    "shortName": symbol,
+                                    "currency": "EUR",
+                                    "regularMarketPrice": 19123.5,
+                                    "regularMarketTime": quote,
+                                    "gmtoffset": 3600,
+                                    "exchangeTimezoneName": "Europe/Berlin",
+                                    "instrumentType": "INDEX" if symbol.startswith("^") else "EQUITY",
+                                    "regularMarketDayHigh": 19200.0,
+                                    "regularMarketDayLow": 19010.0,
+                                    "regularMarketVolume": 12_000_000,
+                                    "currentTradingPeriod": {
+                                        "regular": {"start": next_open, "end": next_close},
+                                    },
+                                },
+                                "timestamp": [yesterday, today_bar],
+                                "indicators": {
+                                    "quote": [
+                                        {
+                                            "close": [19000.0, None],
+                                            "high": [19080.0, None],
+                                            "low": [18940.0, None],
+                                            "volume": [80_000_000, None],
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                        "error": None,
+                    }
+                }
+                snap = parse_chart(symbol, "5d", payload, now=evening)
+                self.assertEqual(snap["market_state"], "closed")
+                self.assertFalse(snap["intraday"])
+                self.assertTrue(snap["close_fill"])
+                self.assertEqual(snap["dates"][-1], "2026-11-18")
+                text = format_context(snap)
+                self.assertNotIn("intraday", text.lower())
+                self.assertIn("Marktstatus: geschlossen", text)
+                self.assertIn("Schlusskurs:", text)
+                self.assertIn("letzter Schluss", text)
+                self.assertIn("18.11. 19.123,50 (letzter Schluss)", text)
+
     def test_no_intraday_bar_without_live_price(self):
         payload = {
             "chart": {
@@ -426,12 +484,15 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("Websuche", text)
         self.assertNotIn("X-Suche", text)
         self.assertNotIn("Recherchiere", text)
-        self.assertEqual(tool_args(MODERATOR, use_web=True, use_x=True), {"tools": []})
+        moderator = tool_args(MODERATOR, use_web=True, use_x=True)
+        self.assertNotIn("tools", moderator)
         self.assertEqual(
             tool_args(AGENTS[0], use_web=True, use_x=False),
             {"tools": [{"type": "web_search"}]},
         )
-        self.assertEqual(tool_args(AGENTS[0], use_web=False, use_x=False), {})
+        quiet_tools = tool_args(AGENTS[0], use_web=False, use_x=False)
+        self.assertNotIn("tools", quiet_tools)
+        self.assertEqual(quiet_tools, {})
 
 
 class TranscriptTests(unittest.TestCase):

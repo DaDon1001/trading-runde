@@ -194,6 +194,7 @@ def failed(symbol: str, error: str, *, mock: bool = False) -> dict:
         "market_state": "",
         "quoted_at": None,
         "intraday": False,
+        "close_fill": False,
         "error": error,
     }
 
@@ -335,6 +336,8 @@ def quote_notes(snapshot: dict | None, *, now: datetime | None = None) -> list[s
         notes.append("nur reguläre Handelszeit")
     if snapshot.get("intraday"):
         notes.append("letzter Punkt ist intraday")
+    elif snapshot.get("close_fill"):
+        notes.append("letzter Punkt ist der letzte Schluss")
     return notes
 
 
@@ -357,9 +360,13 @@ def format_context(snapshot: dict | None) -> str:
     notes = quote_notes(snapshot)
     if notes:
         lines.append(" · ".join(notes))
+    if snapshot.get("market_state") == "closed":
+        price_line = f"Schlusskurs: {fmt_number(snapshot['price'], digits)} (letzter Schluss)"
+    else:
+        price_line = f"Letzter Kurs: {fmt_number(snapshot['price'], digits)}"
     lines.extend(
         [
-            f"Letzter Kurs: {fmt_number(snapshot['price'], digits)}",
+            price_line,
             (
                 f"Vorheriger Schluss: {fmt_number(snapshot['prev_close'], digits)} "
                 f"(Veränderung {fmt_pct(snapshot['change_pct'])})"
@@ -384,6 +391,8 @@ def format_context(snapshot: dict | None) -> str:
         bit = f"{datetime.strptime(day, '%Y-%m-%d'):%d.%m.} {fmt_number(close, price_digits(close))}"
         if snapshot.get("intraday") and day == last_day:
             bit += " (intraday)"
+        elif snapshot.get("close_fill") and day == last_day:
+            bit += " (letzter Schluss)"
         bits.append(bit)
     lines.append(f"Letzte Schlüsse: {' · '.join(bits)}")
     lines.append("Das ist das in der App gewählte Symbol. Wenn die Frage ein anderes meint, sag das klar.")
@@ -457,6 +466,7 @@ def sample_market(symbol: str, period: str, *, today: date | None = None) -> dic
         "market_state": "",
         "quoted_at": None,
         "intraday": False,
+        "close_fill": False,
         "error": "",
     }
 
@@ -470,7 +480,7 @@ def fetch_market(symbol: str, period: str) -> dict:
     return parse_chart(sym, period, payload)
 
 
-def parse_chart(symbol: str, period: str, payload: dict) -> dict:
+def parse_chart(symbol: str, period: str, payload: dict, *, now: datetime | None = None) -> dict:
     period = period if period in PERIODS else "3mo"
     chart = payload.get("chart") if isinstance(payload, dict) else None
     if not isinstance(chart, dict):
@@ -533,7 +543,9 @@ def parse_chart(symbol: str, period: str, payload: dict) -> dict:
     last_close = series[-1][0]
     price = live * scale if live is not None and live > 0 else last_close
     session_day = _session_day(meta, tz, days[-1])
+    state = _market_state(meta, now)
     intraday = False
+    close_fill = False
     # Yahoo liefert bei .DE-Aktien und Indizes wie ^GDAXI für heute oft close=null,
     # der Tag fällt dann aus der Serie. Liegt die Session dahinter, den laufenden
     # Tag aus dem Live-Kurs und den Tages-Hoch/Tief/Volumen der Meta anhängen.
@@ -555,7 +567,11 @@ def parse_chart(symbol: str, period: str, payload: dict) -> dict:
         days.append(session_day)
         series.append((price, high, low, vol))
         prev_close = last_close
-        intraday = True
+        # Nur in der laufenden Session ist das Intraday. Nach dem Schluss ist es der letzte Kurs.
+        if state == "open":
+            intraday = True
+        elif state == "closed":
+            close_fill = True
     # Liegt der Live-Kurs auf demselben Tag wie die letzte Kerze, ist der
     # letzte Schluss der Vortag. Sonst ist der Vortag die letzte Kerze.
     elif days[-1] == session_day and len(series) > 1:
@@ -590,9 +606,10 @@ def parse_chart(symbol: str, period: str, payload: dict) -> dict:
         "dates": days,
         "closes": [item[0] for item in series],
         "crypto": _is_crypto(symbol, meta),
-        "market_state": _market_state(meta),
+        "market_state": state,
         "quoted_at": int(quoted) if quoted is not None and quoted > 0 else None,
         "intraday": intraday,
+        "close_fill": close_fill,
         "error": "",
     }
 

@@ -184,15 +184,20 @@ def describe_error(exc: BaseException) -> str:
 
 
 def tool_args(agent: dict, *, use_web: bool, use_x: bool) -> dict:
-    """Moderator recherchiert nicht. Andere Agenten bekommen nur die eingeschalteten Suchen."""
+    """Moderator recherchiert nicht. Andere Agenten bekommen nur die eingeschalteten Suchen.
+
+    Ohne Werkzeuge fehlt das Feld `tools` ganz. `tools: []` schickt die xAI-API nicht.
+    """
     if agent.get("name") == MODERATOR["name"]:
-        return {"tools": []}
+        return {}
     tools = []
     if use_web:
         tools.append({"type": "web_search"})
     if use_x:
         tools.append({"type": "x_search"})
-    return {"tools": tools} if tools else {}
+    if not tools:
+        return {}
+    return {"tools": tools}
 
 
 def speak(agent: dict, *, use_web: bool, use_x: bool) -> dict:
@@ -306,12 +311,15 @@ def render_market() -> None:
     elif not snap.get("crypto"):
         change_help = "Nur reguläre Handelszeit, ohne Vor- und Nachbörse."
     m1, m2, m3 = st.columns(3)
-    m1.metric("Letzter Kurs", price_text, delta=day_delta, help=change_help)
+    price_label = "Schlusskurs" if snap.get("market_state") == "closed" else "Letzter Kurs"
+    m1.metric(price_label, price_text, delta=day_delta, help=change_help)
     m2.metric("Vortag", f"{fmt_number(snap['prev_close'], digits)} {snap['currency']}".strip())
     m3.metric(snap["period_label"], fmt_pct(snap["period_change_pct"]))
     hints = [""] * len(snap["dates"])
-    if snap.get("intraday") and hints:
+    if hints and snap.get("intraday"):
         hints[-1] = "intraday"
+    elif hints and snap.get("close_fill"):
+        hints[-1] = "letzter Schluss"
     frame = pd.DataFrame(
         {
             "Datum": pd.to_datetime(snap["dates"]),
