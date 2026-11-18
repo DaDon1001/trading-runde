@@ -98,5 +98,10 @@ def _research_sentence(use_web: bool, use_x: bool) -> str:
 
 def instructions(agent: dict, trader: str, *, use_web: bool, use_x: bool) -> str:
     name = (trader or "").strip() or "Trader"
-    body = COMMON.replace("{trader}", name).replace("{research}", _research_sentence(use_web, use_x))
+    # Der Moderator fasst nur zusammen und bekommt keine Recherche-Anweisung.
+    if agent.get("name") == MODERATOR["name"]:
+        research = ""
+    else:
+        research = _research_sentence(use_web, use_x)
+    body = COMMON.replace("{trader}", name).replace("{research}", research)
     return f"{body}\n\nDeine Rolle: {agent['name']}. {agent['role']}"

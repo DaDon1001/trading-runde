@@ -12,6 +12,7 @@ import hashlib
 import json
 import random
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -98,6 +99,22 @@ _SAMPLE_BASE = {
 }
 _SAMPLE_BARS = {"5d": 5, "1mo": 22, "3mo": 66, "6mo": 132, "1y": 252, "2y": 504}
 _INDEX_CCY = {"^GDAXI": "EUR", "^STOXX50E": "EUR", "^FTSE": "GBP", "^N225": "JPY", "^FCHI": "EUR"}
+# Eine kurze Wiederholung, wenn Yahoo drosselt oder selbst ausfällt. Danach gilt der Abruf als ausgefallen.
+_RETRY_PAUSE = 0.5
+_STATE_FROM_YAHOO = {
+    "REGULAR": "open",
+    "CLOSED": "closed",
+    "PRE": "pre",
+    "PREPRE": "pre",
+    "POST": "post",
+    "POSTPOST": "post",
+}
+_STATE_LABELS = {
+    "open": "geöffnet",
+    "closed": "geschlossen",
+    "pre": "Vorbörse",
+    "post": "Nachbörse",
+}
 
 
 class MarketUnavailable(Exception):
@@ -173,6 +190,10 @@ def failed(symbol: str, error: str, *, mock: bool = False) -> dict:
         "source": "Beispieldaten (MOCK)" if mock else "Yahoo Finance",
         "dates": [],
         "closes": [],
+        "crypto": False,
+        "market_state": "",
+        "quoted_at": None,
+        "intraday": False,
         "error": error,
     }
 
@@ -231,6 +252,92 @@ def _preset_name(symbol: str) -> str:
     return symbol
 
 
+def _number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def format_age(quoted_at, *, now: datetime | None = None) -> str:
+    """Wie alt der letzte Kurs ist. Leer, wenn kein Zeitstempel vorliegt."""
+    stamp = _number(quoted_at)
+    if stamp is None or stamp <= 0:
+        return ""
+    moment = now or datetime.now(timezone.utc)
+    seconds = int(moment.timestamp() - stamp)
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return "unter 1 Minute"
+    if seconds < 3600:
+        minutes = seconds // 60
+        unit = "Minute" if minutes == 1 else "Minuten"
+        return f"{minutes} {unit}"
+    if seconds < 86400:
+        hours = seconds // 3600
+        unit = "Stunde" if hours == 1 else "Stunden"
+        return f"{hours} {unit}"
+    days = seconds // 86400
+    unit = "Tag" if days == 1 else "Tage"
+    return f"{days} {unit}"
+
+
+def _market_state(meta: dict, now: datetime | None = None) -> str:
+    """open, closed, pre, post – aus marketState, sonst aus currentTradingPeriod."""
+    raw = str(meta.get("marketState") or "").strip().upper()
+    mapped = _STATE_FROM_YAHOO.get(raw)
+    if mapped:
+        return mapped
+    period = meta.get("currentTradingPeriod")
+    if not isinstance(period, dict):
+        return ""
+    moment = now or datetime.now(timezone.utc)
+    stamp = moment.timestamp()
+    saw_window = False
+    for key, label in (("regular", "open"), ("pre", "pre"), ("post", "post")):
+        window = period.get(key)
+        if not isinstance(window, dict):
+            continue
+        start, end = _number(window.get("start")), _number(window.get("end"))
+        if start is None or end is None:
+            continue
+        saw_window = True
+        if start <= stamp < end:
+            return label
+    return "closed" if saw_window else ""
+
+
+def _is_crypto(symbol: str, meta: dict | None = None) -> bool:
+    meta = meta or {}
+    kind = str(meta.get("instrumentType") or meta.get("quoteType") or "").upper()
+    if kind == "CRYPTOCURRENCY":
+        return True
+    sym = str(meta.get("symbol") or symbol or "").upper()
+    return sym.endswith(("-USD", "-EUR", "-USDT", "-USDC"))
+
+
+def quote_notes(snapshot: dict | None, *, now: datetime | None = None) -> list[str]:
+    """Frische, Marktstatus und was die Tagesveränderung bedeutet. Für UI und Prompt."""
+    if not snapshot or not snapshot.get("ok"):
+        return []
+    notes: list[str] = []
+    label = _STATE_LABELS.get(snapshot.get("market_state") or "")
+    if label:
+        notes.append(f"Marktstatus: {label}")
+    age = format_age(snapshot.get("quoted_at"), now=now)
+    if age:
+        notes.append(f"Datenalter: {age}")
+    # Live-Krypto: Yahoo rechnet die Tagesveränderung ab 00:00 UTC.
+    # Aktien und Indizes: die Serie enthält nur die reguläre Handelszeit.
+    if snapshot.get("crypto") and not snapshot.get("mock"):
+        notes.append("Tagesveränderung seit 00:00 UTC")
+    elif not snapshot.get("crypto"):
+        notes.append("nur reguläre Handelszeit")
+    if snapshot.get("intraday"):
+        notes.append("letzter Punkt ist intraday")
+    return notes
+
+
 def format_context(snapshot: dict | None) -> str:
     """Kurzer Block für den Prompt. Enthält keine erfundenen Live-Kurse."""
     if not snapshot:
@@ -246,17 +353,24 @@ def format_context(snapshot: dict | None) -> str:
     lines = [
         f"Marktdaten ({snapshot['source']}, Tagesdaten, Stand {snapshot['as_of']}):",
         f"{snapshot['name']} ({snapshot['symbol']}), Währung {snapshot['currency'] or '—'}",
-        f"Letzter Kurs: {fmt_number(snapshot['price'], digits)}",
-        (
-            f"Vorheriger Schluss: {fmt_number(snapshot['prev_close'], digits)} "
-            f"(Veränderung {fmt_pct(snapshot['change_pct'])})"
-        ),
-        (
-            f"Zeitraum {snapshot['period_label']}: Hoch {fmt_number(snapshot['high'], digits)} · "
-            f"Tief {fmt_number(snapshot['low'], digits)} · "
-            f"Veränderung {fmt_pct(snapshot['period_change_pct'])}"
-        ),
     ]
+    notes = quote_notes(snapshot)
+    if notes:
+        lines.append(" · ".join(notes))
+    lines.extend(
+        [
+            f"Letzter Kurs: {fmt_number(snapshot['price'], digits)}",
+            (
+                f"Vorheriger Schluss: {fmt_number(snapshot['prev_close'], digits)} "
+                f"(Veränderung {fmt_pct(snapshot['change_pct'])})"
+            ),
+            (
+                f"Zeitraum {snapshot['period_label']}: Hoch {fmt_number(snapshot['high'], digits)} · "
+                f"Tief {fmt_number(snapshot['low'], digits)} · "
+                f"Veränderung {fmt_pct(snapshot['period_change_pct'])}"
+            ),
+        ]
+    )
     if snapshot.get("volume"):
         avg = snapshot.get("avg_volume")
         vol = f"Volumen letzter Tag: {fmt_volume(snapshot['volume'])}"
@@ -264,11 +378,14 @@ def format_context(snapshot: dict | None) -> str:
             vol += f" · Schnitt: {fmt_volume(avg)}"
         lines.append(vol)
     tail = list(zip(snapshot["dates"][-8:], snapshot["closes"][-8:]))
-    recent = " · ".join(
-        f"{datetime.strptime(day, '%Y-%m-%d'):%d.%m.} {fmt_number(close, price_digits(close))}"
-        for day, close in tail
-    )
-    lines.append(f"Letzte Schlüsse: {recent}")
+    last_day = snapshot["dates"][-1] if snapshot.get("dates") else ""
+    bits = []
+    for day, close in tail:
+        bit = f"{datetime.strptime(day, '%Y-%m-%d'):%d.%m.} {fmt_number(close, price_digits(close))}"
+        if snapshot.get("intraday") and day == last_day:
+            bit += " (intraday)"
+        bits.append(bit)
+    lines.append(f"Letzte Schlüsse: {' · '.join(bits)}")
     lines.append("Das ist das in der App gewählte Symbol. Wenn die Frage ein anderes meint, sag das klar.")
     if snapshot.get("mock"):
         lines.append(
@@ -336,6 +453,10 @@ def sample_market(symbol: str, period: str, *, today: date | None = None) -> dic
         "source": "Beispieldaten (MOCK)",
         "dates": [day.isoformat() for day in days],
         "closes": closes,
+        "crypto": crypto,
+        "market_state": "",
+        "quoted_at": None,
+        "intraday": False,
         "error": "",
     }
 
@@ -406,15 +527,38 @@ def parse_chart(symbol: str, period: str, payload: dict) -> dict:
                 min(prev[2], low),
                 vol if vol is not None else prev[3],
             )
-    days = list(merged)
+    days = sorted(merged)
     series = [merged[day] for day in days]
-    live = meta.get("regularMarketPrice")
+    live = _number(meta.get("regularMarketPrice"))
     last_close = series[-1][0]
-    price = float(live) * scale if isinstance(live, (int, float)) and live > 0 else last_close
+    price = live * scale if live is not None and live > 0 else last_close
     session_day = _session_day(meta, tz, days[-1])
-    # Liegt der Live-Kurs auf einem neueren Tag als die letzte Kerze, ist der
-    # letzte Schluss der Vortag. Sonst ist der Vortag die Kerze davor.
-    if days[-1] == session_day and len(series) > 1:
+    intraday = False
+    # Yahoo liefert bei .DE-Aktien und Indizes wie ^GDAXI für heute oft close=null,
+    # der Tag fällt dann aus der Serie. Liegt die Session dahinter, den laufenden
+    # Tag aus dem Live-Kurs und den Tages-Hoch/Tief/Volumen der Meta anhängen.
+    if session_day > days[-1] and live is not None and live > 0:
+        raw_high = _number(meta.get("regularMarketDayHigh"))
+        if raw_high is None:
+            raw_high = _number(meta.get("dayHigh"))
+        raw_low = _number(meta.get("regularMarketDayLow"))
+        if raw_low is None:
+            raw_low = _number(meta.get("dayLow"))
+        raw_vol = _number(meta.get("regularMarketVolume"))
+        if raw_vol is None:
+            raw_vol = _number(meta.get("volume"))
+        high = (raw_high if raw_high is not None and raw_high > 0 else live) * scale
+        low = (raw_low if raw_low is not None and raw_low > 0 else live) * scale
+        high = max(high, price)
+        low = min(low, price)
+        vol = raw_vol if raw_vol is not None and raw_vol >= 0 else None
+        days.append(session_day)
+        series.append((price, high, low, vol))
+        prev_close = last_close
+        intraday = True
+    # Liegt der Live-Kurs auf demselben Tag wie die letzte Kerze, ist der
+    # letzte Schluss der Vortag. Sonst ist der Vortag die letzte Kerze.
+    elif days[-1] == session_day and len(series) > 1:
         prev_close = series[-2][0]
         series[-1] = (price, max(series[-1][1], price), min(series[-1][2], price), series[-1][3])
     else:
@@ -423,6 +567,7 @@ def parse_chart(symbol: str, period: str, payload: dict) -> dict:
     as_of = _as_of(meta, tz, days[-1])
     name = _instrument_name(meta, symbol)
     vols = [item[3] for item in series if item[3]]
+    quoted = _number(meta.get("regularMarketTime"))
     return {
         "ok": True,
         "mock": False,
@@ -444,6 +589,10 @@ def parse_chart(symbol: str, period: str, payload: dict) -> dict:
         "source": "Yahoo Finance",
         "dates": days,
         "closes": [item[0] for item in series],
+        "crypto": _is_crypto(symbol, meta),
+        "market_state": _market_state(meta),
+        "quoted_at": int(quoted) if quoted is not None and quoted > 0 else None,
+        "intraday": intraday,
         "error": "",
     }
 
@@ -465,31 +614,84 @@ def _as_of(meta: dict, tz: timezone, fallback_day: str) -> str:
     return f"{parsed:%d.%m.%Y} ({zone})"
 
 
+def _transient_status(code: int) -> bool:
+    return code == 429 or code >= 500
+
+
+def _read_chart(url: str) -> dict:
+    request = urllib.request.Request(url, headers=_HEADERS)
+    with urllib.request.urlopen(request, timeout=15) as response:
+        status = getattr(response, "status", 200)
+        raw = response.read()
+    # Fehlercodes kommen sonst als HTTPError. Trotzdem erst den Status prüfen.
+    if status >= 400:
+        raise MarketUnavailable(
+            f"Kursdaten gerade nicht erreichbar (HTTP {status}). "
+            "Die Runde kann ohne Live-Kurse weiterreden."
+        )
+    return json.loads(raw.decode())
+
+
+def _chart_error_payload(exc: urllib.error.HTTPError) -> dict | None:
+    """JSON-Fehlerbody nur bei 400/404/422 lesen. 429 und 5xx bleiben Ausfälle."""
+    if _transient_status(exc.code) or exc.code not in (400, 404, 422):
+        return None
+    body = b""
+    if exc.fp is not None:
+        try:
+            body = exc.read()
+        except Exception:
+            body = b""
+    if body:
+        try:
+            parsed = json.loads(body.decode())
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+    return {"chart": {"result": None, "error": {"code": str(exc.code)}}}
+
+
+def _error_detail(exc: Exception | None) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    if exc is None:
+        return "unbekannt"
+    return type(exc).__name__
+
+
 def _download_chart(symbol: str, period: str) -> dict:
     encoded = urllib.parse.quote(symbol, safe="")
     query = urllib.parse.urlencode({"range": period, "interval": "1d", "includePrePost": "false"})
     last_error: Exception | None = None
+    retried = False
     for host in _HOSTS:
         url = f"https://{host}/v8/finance/chart/{encoded}?{query}"
-        request = urllib.request.Request(url, headers=_HEADERS)
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                return json.loads(response.read().decode())
+            return _read_chart(url)
         except urllib.error.HTTPError as exc:
             last_error = exc
-            body = exc.read() if exc.fp else b""
-            if body:
+            if _transient_status(exc.code) and not retried:
+                retried = True
+                time.sleep(_RETRY_PAUSE)
                 try:
-                    return json.loads(body.decode())
-                except json.JSONDecodeError:
-                    pass
-            if exc.code in (404, 400, 422):
-                return {"chart": {"result": None, "error": {"code": str(exc.code)}}}
+                    return _read_chart(url)
+                except urllib.error.HTTPError as retry_exc:
+                    last_error = retry_exc
+                    exc = retry_exc
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as retry_exc:
+                    last_error = retry_exc
+                    continue
+            if _transient_status(exc.code):
+                continue
+            parsed = _chart_error_payload(exc)
+            if parsed is not None:
+                return parsed
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last_error = exc
-    detail = type(last_error).__name__ if last_error else "unbekannt"
     raise MarketUnavailable(
-        f"Kursdaten gerade nicht erreichbar ({detail}). Die Runde kann ohne Live-Kurse weiterreden."
+        f"Kursdaten gerade nicht erreichbar ({_error_detail(last_error)}). "
+        "Die Runde kann ohne Live-Kurse weiterreden."
     )
 
 

@@ -18,7 +18,7 @@ Ein Chat im Browser, in dem mehrere Grok-Agenten mit unterschiedlichen Rollen ge
 ## Kurse und Chart
 Über dem Chat wählst du ein Symbol oder tippst ein Yahoo-Kürzel (`NVDA`, `SAP.DE`, `^GDAXI`, `BTC-USD`) und einen Zeitraum. Die App zeigt den letzten Kurs, die Veränderung und einen Chart. Dieselben Zahlen stehen im Prompt, damit die Runde nicht raten muss.
 
-Die Daten kommen ohne API-Key von **Yahoo Finance** (Tagesdaten). `BTC`, `ETH` und `SOL` werden zu den USD-Paaren, `DAX` zum Index `^GDAXI`. Klappt der Abruf nicht (falsches Symbol, kein Netz, Yahoo kurz nicht erreichbar), erscheint eine Warnung und die Runde diskutiert ohne Kurse weiter. **Aktualisieren** holt die Zahlen neu.
+Die Daten kommen ohne API-Key von **Yahoo Finance** (Tagesdaten). `BTC`, `ETH` und `SOL` werden zu den USD-Paaren, `DAX` zum Index `^GDAXI`. Ein erfolgreicher Abruf wird etwa zwei Minuten wiederverwendet, ein Fehlschlag nicht. **Aktualisieren** holt sofort neu. Unter dem Chart stehen Datenalter und Marktstatus. Aktien und Indizes sind nur die reguläre Handelszeit; bei Krypto gilt die Tagesveränderung seit 00:00 UTC. Fehlt bei Yahoo der heutige Schluss, ergänzt die App den laufenden Tag aus dem letzten Kurs. Klappt der Abruf nicht (falsches Symbol, kein Netz, Yahoo kurz nicht erreichbar), erscheint eine Warnung und die Runde diskutiert ohne Kurse weiter.
 
 Mit `MOCK=1` gibt es keine Live-Kurse und keine Grok-Aufrufe: der Chart zeigt stabile Beispieldaten, die Agenten antworten mit Platzhaltern. Dafür brauchst du weder Key noch Netz.
 
@@ -32,7 +32,7 @@ Mit `MOCK=1` gibt es keine Live-Kurse und keine Grok-Aufrufe: der Chart zeigt st
    pip install -r requirements.txt
    cp .env.example .env             # Windows: copy .env.example .env
    ```
-4. In der Datei `.env` deinen Key bei `XAI_API_KEY=` eintragen. Optional steht dort auch `TRADER_NAME` (Standard: Daniel).
+4. In der Datei `.env` den Platzhalter `<DEIN-KEY>` durch deinen Key ersetzen. Optional steht dort auch `TRADER_NAME` (Standard: Daniel).
 5. Starten:
    ```bash
    streamlit run app.py
@@ -46,7 +46,7 @@ python -m venv .venv
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # nur beim ersten Mal, mit J bestätigen
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Set-Content .env "XAI_API_KEY=xai-dein-echter-key"
+Set-Content .env "XAI_API_KEY=<DEIN-KEY>"
 streamlit run app.py
 ```
 
@@ -70,5 +70,5 @@ So geraten sie sich nicht in die Quere:
 
 ## Hinweise
 - Kosten: Jede Agenten-Antwort ist ein API-Aufruf. Eine Runde mit allen 8 Agenten = 8 Aufrufe. Wen du nicht brauchst, schaltest du links aus.
-- **Recherche:** Die Agenten suchen selbst im Web und auf X nach News und Stimmung und hängen ihre Quellen als Links an. In der Seitenleiste kannst du Web- und X-Suche einzeln abschalten (spart Kosten). Kurszahlen aus dem Chart haben Vorrang vor selbst gesuchten Kursen.
+- **Recherche:** Die Diskussions-Agenten suchen selbst im Web und auf X nach News und Stimmung und hängen ihre Quellen als Links an die Anzeige. Diese Linklisten gehen nicht erneut in den Prompt. Der Moderator fasst nur zusammen und recherchiert nicht. In der Seitenleiste kannst du Web- und X-Suche einzeln abschalten (spart Kosten). Kurszahlen aus dem Chart haben Vorrang vor selbst gesuchten Kursen.
 - Alles ist Meinung von KI-Modellen, **keine Finanzberatung**.
